@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Error};
 use graph::constraint_violation;
-use graph::data::value::Object;
+use graph::data::value::{Object, Word};
 use graph::prelude::{r, CacheWeight};
 use graph::slog::warn;
 use graph::util::cache_weight;
@@ -19,6 +19,7 @@ use graph::{
         s, ApiSchema, AttributeNames, BlockNumber, ChildMultiplicity, EntityCollection,
         EntityFilter, EntityLink, EntityOrder, EntityWindow, Logger, ParentLink,
         QueryExecutionError, QueryStore, StoreError, Value as StoreValue, WindowAttribute,
+        ENV_VARS,
     },
 };
 
@@ -32,19 +33,6 @@ lazy_static! {
     static ref ARG_FIRST: String = String::from("first");
     static ref ARG_SKIP: String = String::from("skip");
     static ref ARG_ID: String = String::from("id");
-
-    /// Setting this environment variable to any value will enable the experimental feature "Select
-    /// by Specific Attributes".
-    static ref DISABLE_EXPERIMENTAL_FEATURE_SELECT_BY_SPECIFIC_ATTRIBUTE_NAMES: bool =
-        !std::env::var("GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES").is_ok();
-
-    static ref RESULT_SIZE_WARN: usize = std::env::var("GRAPH_GRAPHQL_WARN_RESULT_SIZE")
-        .map(|s| s.parse::<usize>().expect("`GRAPH_GRAPHQL_WARN_RESULT_SIZE` is a number"))
-        .unwrap_or(std::usize::MAX);
-
-    static ref RESULT_SIZE_ERROR: usize = std::env::var("GRAPH_GRAPHQL_ERROR_RESULT_SIZE")
-        .map(|s| s.parse::<usize>().expect("`GRAPH_GRAPHQL_ERROR_RESULT_SIZE` is a number"))
-        .unwrap_or(std::usize::MAX);
 }
 
 /// Intermediate data structure to hold the results of prefetching entities
@@ -57,7 +45,7 @@ struct Node {
     /// the keys and values of the `children` map, but not of the map itself
     children_weight: usize,
 
-    entity: BTreeMap<String, r::Value>,
+    entity: BTreeMap<Word, r::Value>,
     /// We are using an `Rc` here for two reasons: it allows us to defer
     /// copying objects until the end, when converting to `q::Value` forces
     /// us to copy any child that is referenced by multiple parents. It also
@@ -98,11 +86,11 @@ struct Node {
     /// copies to the point where we need to convert to `q::Value`, and it
     /// would be desirable to base the data structure that GraphQL execution
     /// uses on a DAG rather than a tree, but that's a good amount of work
-    children: BTreeMap<String, Vec<Rc<Node>>>,
+    children: BTreeMap<Word, Vec<Rc<Node>>>,
 }
 
-impl From<BTreeMap<String, r::Value>> for Node {
-    fn from(entity: BTreeMap<String, r::Value>) -> Self {
+impl From<BTreeMap<Word, r::Value>> for Node {
+    fn from(entity: BTreeMap<Word, r::Value>) -> Self {
         Node {
             children_weight: entity.weight(),
             entity,
@@ -163,7 +151,10 @@ impl From<Node> for r::Value {
     fn from(node: Node) -> Self {
         let mut map = node.entity;
         for (key, nodes) in node.children.into_iter() {
-            map.insert(format!("prefetch:{}", key), node_list_as_value(nodes));
+            map.insert(
+                format!("prefetch:{}", key).into(),
+                node_list_as_value(nodes),
+            );
         }
         r::Value::object(map)
     }
@@ -192,7 +183,7 @@ impl Node {
     }
 
     fn get(&self, key: &str) -> Option<&r::Value> {
-        self.entity.get(key)
+        self.entity.get(&key.into())
     }
 
     fn typename(&self) -> &str {
@@ -212,7 +203,7 @@ impl Node {
         let key_weight = response_key.weight();
 
         self.children_weight += nodes_weight(&nodes) + key_weight;
-        let old = self.children.insert(response_key, nodes);
+        let old = self.children.insert(response_key.into(), nodes);
         if let Some(old) = old {
             self.children_weight -= nodes_weight(&old) + key_weight;
         }
@@ -510,12 +501,18 @@ fn execute_root_selection_set(
     execute_selection_set(resolver, ctx, make_root_node(), selection_set)
 }
 
-fn check_result_size(logger: &Logger, size: usize) -> Result<(), QueryExecutionError> {
-    if size > *RESULT_SIZE_ERROR {
-        return Err(QueryExecutionError::ResultTooBig(size, *RESULT_SIZE_ERROR));
+fn check_result_size<'a>(
+    ctx: &'a ExecutionContext<impl Resolver>,
+    size: usize,
+) -> Result<(), QueryExecutionError> {
+    if size > ENV_VARS.graphql.error_result_size {
+        return Err(QueryExecutionError::ResultTooBig(
+            size,
+            ENV_VARS.graphql.error_result_size,
+        ));
     }
-    if size > *RESULT_SIZE_WARN {
-        warn!(logger, "Large query result"; "size" => size);
+    if size > ENV_VARS.graphql.warn_result_size {
+        warn!(ctx.logger, "Large query result"; "size" => size, "query_id" => &ctx.query.query_id);
     }
     Ok(())
 }
@@ -571,12 +568,11 @@ fn execute_selection_set<'a>(
             // If this environment variable is set, the program will use an empty collection that,
             // effectively, causes the `AttributeNames::All` variant to be used as a fallback value for all
             // queries.
-            let collected_columns =
-                if *DISABLE_EXPERIMENTAL_FEATURE_SELECT_BY_SPECIFIC_ATTRIBUTE_NAMES {
-                    SelectedAttributes(BTreeMap::new())
-                } else {
-                    SelectedAttributes::for_field(field)?
-                };
+            let collected_columns = if !ENV_VARS.enable_select_by_specific_attributes {
+                SelectedAttributes(BTreeMap::new())
+            } else {
+                SelectedAttributes::for_field(field)?
+            };
 
             match execute_field(
                 resolver,
@@ -593,7 +589,7 @@ fn execute_selection_set<'a>(
                             Join::perform(&mut parents, children, field.response_key());
                             let weight =
                                 parents.iter().map(|parent| parent.weight()).sum::<usize>();
-                            check_result_size(&ctx.logger, weight)?;
+                            check_result_size(ctx, weight)?;
                         }
                         Err(mut e) => errors.append(&mut e),
                     }

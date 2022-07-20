@@ -131,7 +131,7 @@ fn build_fulltext_filter_from_object(
         |(key, value)| {
             if let r::Value::String(s) = value {
                 Ok(Some(EntityFilter::Equal(
-                    key.clone(),
+                    key.to_string(),
                     Value::String(s.clone()),
                 )))
             } else {
@@ -139,6 +139,18 @@ fn build_fulltext_filter_from_object(
             }
         },
     )
+}
+
+fn parse_change_block_filter(value: &r::Value) -> Result<BlockNumber, QueryExecutionError> {
+    match value {
+        r::Value::Object(object) => i32::try_from_value(
+            object
+                .get("number_gte")
+                .ok_or_else(|| QueryExecutionError::InvalidFilterError)?,
+        )
+        .map_err(|_| QueryExecutionError::InvalidFilterError),
+        _ => Err(QueryExecutionError::InvalidFilterError),
+    }
 }
 
 /// Parses a GraphQL input object into an EntityFilter, if present.
@@ -150,6 +162,15 @@ fn build_filter_from_object(
         object
             .iter()
             .map(|(key, value)| {
+                // Special handling for _change_block input filter since its not a
+                // standard entity filter that is based on entity structure/fields
+                if key == "_change_block" {
+                    return match parse_change_block_filter(value) {
+                        Ok(block_number) => Ok(EntityFilter::ChangeBlockGte(block_number)),
+                        Err(e) => Err(e),
+                    };
+                }
+
                 use self::sast::FilterOp::*;
 
                 let (field_name, op) = sast::parse_field_as_filter(key);
@@ -255,7 +276,7 @@ fn build_fulltext_order_by_from_object(
         Err(QueryExecutionError::FulltextQueryRequiresFilter),
         |(key, value)| {
             if let r::Value::String(_) = value {
-                Ok(Some((key.clone(), ValueType::String)))
+                Ok(Some((key.to_string(), ValueType::String)))
             } else {
                 Err(QueryExecutionError::FulltextQueryRequiresFilter)
             }
@@ -729,6 +750,37 @@ mod tests {
                 "name".to_string(),
                 Value::String("ello".to_string()),
             )]))
+        )
+    }
+
+    #[test]
+    fn build_query_yields_block_change_gte_filter() {
+        let query_field = default_field_with(
+            "where",
+            r::Value::Object(Object::from_iter(vec![(
+                "_change_block".to_string(),
+                r::Value::Object(Object::from_iter(vec![(
+                    "number_gte".to_string(),
+                    r::Value::Int(10),
+                )])),
+            )])),
+        );
+        assert_eq!(
+            build_query(
+                &ObjectType {
+                    fields: vec![field("name", Type::NamedType("string".to_owned()))],
+                    ..default_object()
+                },
+                BLOCK_NUMBER_MAX,
+                &query_field,
+                &BTreeMap::new(),
+                std::u32::MAX,
+                std::u32::MAX,
+                Default::default()
+            )
+            .unwrap()
+            .filter,
+            Some(EntityFilter::And(vec![EntityFilter::ChangeBlockGte(10)]))
         )
     }
 }

@@ -4,6 +4,7 @@ use super::*;
 use crate::components::server::index_node::VersionInfo;
 use crate::components::transaction_receipt;
 use crate::data::subgraph::status;
+use crate::data::value::Word;
 use crate::data::{query::QueryTarget, subgraph::schema::*};
 
 pub trait SubscriptionManager: Send + Sync + 'static {
@@ -162,7 +163,7 @@ pub trait WritableStore: Send + Sync + 'static {
     /// subgraph block pointer to `block_ptr_to`.
     ///
     /// `block_ptr_to` must point to the parent block of the subgraph block pointer.
-    fn revert_block_operations(
+    async fn revert_block_operations(
         &self,
         block_ptr_to: BlockPtr,
         firehose_cursor: Option<&str>,
@@ -195,12 +196,12 @@ pub trait WritableStore: Send + Sync + 'static {
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
-    fn transact_block_operations(
+    async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
         firehose_cursor: Option<String>,
         mods: Vec<EntityModification>,
-        stopwatch: StopwatchMetrics,
+        stopwatch: &StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
     ) -> Result<(), StoreError>;
@@ -233,6 +234,9 @@ pub trait WritableStore: Send + Sync + 'static {
     async fn health(&self, id: &DeploymentHash) -> Result<SubgraphHealth, StoreError>;
 
     fn input_schema(&self) -> Arc<Schema>;
+
+    /// Wait for the background writer to finish processing its queue
+    async fn flush(&self) -> Result<(), StoreError>;
 }
 
 #[async_trait]
@@ -358,7 +362,8 @@ pub trait ChainStore: Send + Sync + 'static {
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {
-    /// Cached return value.
+    /// Returns the return value of the provided Ethereum call, if present in
+    /// the cache.
     fn get_call(
         &self,
         contract_address: ethabi::Address,
@@ -366,7 +371,11 @@ pub trait EthereumCallCache: Send + Sync + 'static {
         block: BlockPtr,
     ) -> Result<Option<Vec<u8>>, Error>;
 
-    // Add entry to the cache.
+    /// Returns all cached calls for a given `block`. This method does *not*
+    /// update the last access time of the returned cached calls.
+    fn get_calls_in_block(&self, block: BlockPtr) -> Result<Vec<CachedEthereumCall>, Error>;
+
+    /// Stores the provided Ethereum call in the cache.
     fn set_call(
         &self,
         contract_address: ethabi::Address,
@@ -382,7 +391,7 @@ pub trait QueryStore: Send + Sync {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<Vec<BTreeMap<String, r::Value>>, QueryExecutionError>;
+    ) -> Result<Vec<BTreeMap<Word, r::Value>>, QueryExecutionError>;
 
     async fn is_deployment_synced(&self) -> Result<bool, Error>;
 
@@ -390,7 +399,7 @@ pub trait QueryStore: Send + Sync {
 
     fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError>;
 
-    fn wait_stats(&self) -> PoolWaitStats;
+    fn wait_stats(&self) -> Result<PoolWaitStats, StoreError>;
 
     /// If `block` is `None`, assumes the latest block.
     async fn has_non_fatal_errors(&self, block: Option<BlockNumber>) -> Result<bool, StoreError>;
@@ -404,7 +413,7 @@ pub trait QueryStore: Send + Sync {
     fn network_name(&self) -> &str;
 
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
 }
 
 /// A view of the store that can provide information about the indexing status
@@ -412,7 +421,7 @@ pub trait QueryStore: Send + Sync {
 #[async_trait]
 pub trait StatusStore: Send + Sync + 'static {
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
 
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
 
@@ -446,4 +455,13 @@ pub trait StatusStore: Send + Sync + 'static {
         indexer: &Option<Address>,
         block: BlockPtr,
     ) -> Result<Option<[u8; 32]>, StoreError>;
+
+    /// Like `get_proof_of_indexing` but returns a Proof of Indexing signed by
+    /// address `0x00...0`, which allows it to be shared in public without
+    /// revealing the indexers _real_ Proof of Indexing.
+    async fn get_public_proof_of_indexing(
+        &self,
+        subgraph_id: &DeploymentHash,
+        block_number: BlockNumber,
+    ) -> Result<Option<(PartialBlockPtr, [u8; 32])>, StoreError>;
 }

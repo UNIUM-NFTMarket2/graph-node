@@ -62,7 +62,11 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    fn revert_block_operations(&self, _: BlockPtr, _: Option<&str>) -> Result<(), StoreError> {
+    async fn revert_block_operations(
+        &self,
+        _: BlockPtr,
+        _: Option<&str>,
+    ) -> Result<(), StoreError> {
         unimplemented!()
     }
 
@@ -99,12 +103,12 @@ impl WritableStore for MockStore {
         }
     }
 
-    fn transact_block_operations(
+    async fn transact_block_operations(
         &self,
         _: BlockPtr,
         _: Option<String>,
         _: Vec<EntityModification>,
-        _: StopwatchMetrics,
+        _: &StopwatchMetrics,
         _: Vec<StoredDynamicDataSource>,
         _: Vec<SubgraphError>,
     ) -> Result<(), StoreError> {
@@ -144,6 +148,10 @@ impl WritableStore for MockStore {
 
     fn input_schema(&self) -> Arc<Schema> {
         SCHEMA.clone()
+    }
+
+    async fn flush(&self) -> Result<(), StoreError> {
+        unimplemented!()
     }
 }
 

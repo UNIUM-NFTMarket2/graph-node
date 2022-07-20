@@ -1,38 +1,37 @@
-use std::{collections::HashMap, env, num::ParseIntError, sync::Arc, time::Duration};
-
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
 use graph::{data::graphql::effort::LoadManager, prelude::chrono, prometheus::Registry};
-use graph_core::MetricsRegistry;
-use graph_graphql::prelude::GraphQlRunner;
-use lazy_static::lazy_static;
-use structopt::StructOpt;
-
 use graph::{
     log::logger,
-    prelude::{info, o, slog, tokio, Logger, NodeId},
+    prelude::{
+        anyhow::{self, Context as AnyhowContextTrait},
+        info, o, slog, tokio, Logger, NodeId, ENV_VARS,
+    },
     url::Url,
 };
-use graph_node::{manager::PanicSubscriptionManager, store_builder::StoreBuilder, MetricsContext};
-use graph_store_postgres::{
-    connection_pool::ConnectionPool, BlockStore, Shard, Store, SubgraphStore, SubscriptionManager,
-    PRIMARY_SHARD,
-};
-
+use graph_chain_ethereum::{EthereumAdapter, EthereumNetworks};
+use graph_core::MetricsRegistry;
+use graph_graphql::prelude::GraphQlRunner;
 use graph_node::config::{self, Config as Cfg};
 use graph_node::manager::commands;
+use graph_node::{
+    chain::create_ethereum_networks,
+    manager::{deployment::DeploymentSearch, PanicSubscriptionManager},
+    store_builder::StoreBuilder,
+    MetricsContext,
+};
+use graph_store_postgres::ChainStore;
+use graph_store_postgres::{
+    connection_pool::ConnectionPool, BlockStore, NotificationSender, Shard, Store, SubgraphStore,
+    SubscriptionManager, PRIMARY_SHARD,
+};
+use lazy_static::lazy_static;
+use std::{collections::HashMap, env, num::ParseIntError, sync::Arc, time::Duration};
+use structopt::StructOpt;
 
 const VERSION_LABEL_KEY: &str = "version";
 
 git_testament!(TESTAMENT);
-
-macro_rules! die {
-    ($fmt:expr, $($arg:tt)*) => {{
-        use std::io::Write;
-        writeln!(&mut ::std::io::stderr(), $fmt, $($arg)*).unwrap();
-        ::std::process::exit(1)
-    }}
-}
 
 lazy_static! {
     static ref RENDERED_TESTAMENT: String = render_testament!(TESTAMENT);
@@ -91,9 +90,14 @@ pub enum Command {
         delay: u64,
     },
     /// Print details about a deployment
+    ///
+    /// The deployment can be specified as either a subgraph name, an IPFS
+    /// hash `Qm..`, or the database namespace `sgdNNN`. Since the same IPFS
+    /// hash can be deployed in multiple shards, it is possible to specify
+    /// the shard by adding `:shard` to the IPFS hash.
     Info {
-        /// The deployment, an id, schema name or subgraph name
-        name: String,
+        /// The deployment (see above)
+        deployment: DeploymentSearch,
         /// List only current version
         #[structopt(long, short)]
         current: bool,
@@ -124,19 +128,15 @@ pub enum Command {
     },
     /// Assign or reassign a deployment
     Reassign {
-        /// The id of the deployment to reassign
-        id: String,
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
         /// The name of the node that should index the deployment
         node: String,
-        /// The shard of the deployment if `id` itself is ambiguous
-        shard: Option<String>,
     },
     /// Unassign a deployment
     Unassign {
-        /// The id of the deployment to unassign
-        id: String,
-        /// The shard of the deployment if `id` itself is ambiguous
-        shard: Option<String>,
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
     },
     /// Rewind a subgraph to a specific block
     Rewind {
@@ -156,8 +156,8 @@ pub enum Command {
         block_hash: String,
         /// The block number of the target block
         block_number: i32,
-        /// The deployments to rewind
-        names: Vec<String>,
+        /// The deployments to rewind (see `help info`)
+        deployments: Vec<DeploymentSearch>,
     },
     /// Deploy and run an arbitrary subgraph up to a certain block, although it can surpass it by a few blocks, it's not exact (use for dev and testing purposes) -- WARNING: WILL RUN MIGRATIONS ON THE DB, DO NOT USE IN PRODUCTION
     ///
@@ -271,8 +271,8 @@ pub enum ListenCommand {
     Assignments,
     /// Listen to events for entities in a specific deployment
     Entities {
-        /// The deployment hash
-        deployment: String,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
         /// The entity types for which to print change notifications
         entity_types: Vec<String>,
     },
@@ -291,14 +291,12 @@ pub enum CopyCommand {
         /// How far behind `src` subgraph head to copy
         #[structopt(long, short, default_value = "200")]
         offset: u32,
-        /// The IPFS hash of the source deployment
-        src: String,
+        /// The source deployment (see `help info`)
+        src: DeploymentSearch,
         /// The name of the database shard into which to copy
         shard: String,
         /// The name of the node that should index the copy
         node: String,
-        /// The shard of the `src` subgraph in case that is ambiguous
-        src_shard: Option<String>,
     },
     /// Activate the copy of a deployment.
     ///
@@ -315,8 +313,8 @@ pub enum CopyCommand {
     List,
     /// Print the progress of a copy operation
     Status {
-        /// The internal id of the destination of the copy operation (number)
-        dst: i32,
+        /// The destination deployment of the copy operation (see `help info`)
+        dst: DeploymentSearch,
     },
 }
 
@@ -343,6 +341,25 @@ pub enum ChainCommand {
     /// There must be no deployments using that chain. If there are, the
     /// subgraphs and/or deployments using the chain must first be removed
     Remove { name: String },
+
+    /// Compares cached blocks with fresh ones and clears the block cache when they differ.
+    CheckBlocks {
+        #[structopt(subcommand)] // Note that we mark a field as a subcommand
+        method: CheckBlockMethod,
+
+        /// Chain name (must be an existing chain, see 'chain list')
+        #[structopt(empty_values = false)]
+        chain_name: String,
+    },
+    /// Truncates the whole block cache for the given chain.
+    Truncate {
+        /// Chain name (must be an existing chain, see 'chain list')
+        #[structopt(empty_values = false)]
+        chain_name: String,
+        /// Skips confirmation prompt
+        #[structopt(long, short)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Debug, StructOpt)]
@@ -354,8 +371,11 @@ pub enum StatsCommand {
     /// to distinct entities. It can take up to 5 minutes for this to take
     /// effect.
     AccountLike {
-        #[structopt(long, help = "do not set but clear the account-like flag\n")]
+        #[structopt(long, short, help = "do not set but clear the account-like flag\n")]
         clear: bool,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
+        /// The name of the database table
         table: String,
     },
     /// Show statistics for the tables of a deployment
@@ -367,15 +387,15 @@ pub enum StatsCommand {
     /// in that table, which can be very slow, but is needed since the
     /// statistics based data can be off by an order of magnitude.
     Show {
-        /// The namespace of the deployment in the form `sgdNNNN`
-        nsp: String,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
         /// The name of a table to fully count
         table: Option<String>,
     },
     /// Perform a SQL ANALYZE in a Entity table
     Analyze {
-        /// The id of the deployment
-        id: String,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
         /// The name of the Entity to ANALYZE, in camel case
         entity: String,
     },
@@ -393,11 +413,9 @@ pub enum IndexCommand {
     ///
     /// This command may be time-consuming.
     Create {
-        /// The id of the deployment.
-        ///
-        /// Can be expressed either as its Qm-hash form or as its SQL schema identifier.
+        /// The deployment (see `help info`).
         #[structopt(empty_values = false)]
-        id: String,
+        deployment: DeploymentSearch,
         /// The Entity name.
         ///
         /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
@@ -419,11 +437,9 @@ pub enum IndexCommand {
     },
     /// Lists existing indexes for a given Entity
     List {
-        /// The id of the deployment.
-        ///
-        /// Can be expressed either as its Qm-hash form or as its SQL schema identifier.
+        /// The deployment (see `help info`).
         #[structopt(empty_values = false)]
-        id: String,
+        deployment: DeploymentSearch,
         /// The Entity name.
         ///
         /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
@@ -434,14 +450,29 @@ pub enum IndexCommand {
 
     /// Drops an index for a given deployment, concurrently
     Drop {
-        /// The id of the deployment.
-        ///
-        /// Can be expressed either as its Qm-hash form or as its SQL schema identifier.
+        /// The deployment (see `help info`).
         #[structopt(empty_values = false)]
-        id: String,
+        deployment: DeploymentSearch,
         /// The name of the index to be dropped
         #[structopt(empty_values = false)]
         index_name: String,
+    },
+}
+
+#[derive(Clone, Debug, StructOpt)]
+pub enum CheckBlockMethod {
+    /// The number of the target block
+    ByHash { hash: String },
+
+    /// The hash of the target block
+    ByNumber { number: i32 },
+
+    /// A block number range, inclusive on both ends.
+    ByRange {
+        #[structopt(long, short)]
+        from: Option<i32>,
+        #[structopt(long, short)]
+        to: Option<i32>,
     },
 }
 
@@ -514,6 +545,10 @@ impl Context {
         self.node_id.clone()
     }
 
+    fn notification_sender(&self) -> Arc<NotificationSender> {
+        Arc::new(NotificationSender::new(self.registry.clone()))
+    }
+
     fn primary_pool(self) -> ConnectionPool {
         let primary = self.config.primary_store();
         let pool = StoreBuilder::main_pool(
@@ -521,7 +556,7 @@ impl Context {
             &self.node_id,
             PRIMARY_SHARD.as_str(),
             primary,
-            self.registry,
+            self.metrics_registry(),
             Arc::new(vec![]),
         );
         pool.skip_setup();
@@ -532,13 +567,21 @@ impl Context {
         self.store_and_pools().0.subgraph_store()
     }
 
-    fn subscription_manager(self) -> Arc<SubscriptionManager> {
+    fn subscription_manager(&self) -> Arc<SubscriptionManager> {
         let primary = self.config.primary_store();
+
         Arc::new(SubscriptionManager::new(
             self.logger.clone(),
             primary.connection.to_owned(),
             self.registry.clone(),
         ))
+    }
+
+    fn primary_and_subscription_manager(self) -> (ConnectionPool, Arc<SubscriptionManager>) {
+        let mgr = self.subscription_manager();
+        let primary_pool = self.primary_pool();
+
+        (primary_pool, mgr)
     }
 
     fn store(self) -> Arc<Store> {
@@ -616,15 +659,47 @@ impl Context {
             registry,
         ))
     }
+
+    async fn ethereum_networks(&self) -> anyhow::Result<EthereumNetworks> {
+        let logger = self.logger.clone();
+        let registry = self.metrics_registry();
+        create_ethereum_networks(logger, registry, &self.config).await
+    }
+
+    fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
+        use graph::components::store::BlockStore;
+        self.store()
+            .block_store()
+            .chain_store(&chain_name)
+            .ok_or_else(|| anyhow::anyhow!("Could not find a network named '{}'", chain_name))
+    }
+
+    async fn chain_store_and_adapter(
+        self,
+        chain_name: &str,
+    ) -> anyhow::Result<(Arc<ChainStore>, Arc<EthereumAdapter>)> {
+        let ethereum_networks = self.ethereum_networks().await?;
+        let chain_store = self.chain_store(chain_name)?;
+        let ethereum_adapter = ethereum_networks
+            .networks
+            .get(chain_name)
+            .map(|adapters| adapters.cheapest())
+            .flatten()
+            .ok_or(anyhow::anyhow!(
+                "Failed to obtain an Ethereum adapter for chain '{}'",
+                chain_name
+            ))?;
+        Ok((chain_store, ethereum_adapter))
+    }
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
     let version_label = opt.version_label.clone();
     // Set up logger
-    let logger = match env::var_os("GRAPH_LOG") {
+    let logger = match ENV_VARS.log_levels {
         Some(_) => logger(false),
         None => Logger::root(slog::Discard, o!()),
     };
@@ -636,13 +711,8 @@ async fn main() {
         render_testament!(TESTAMENT)
     );
 
-    let mut config = match Cfg::load(&logger, &opt.clone().into()) {
-        Err(e) => {
-            eprintln!("configuration error: {}", e);
-            std::process::exit(1);
-        }
-        Ok(config) => config,
-    };
+    let mut config = Cfg::load(&logger, &opt.clone().into()).context("Configuration error")?;
+
     if opt.pool_size > 0 && !opt.cmd.use_configured_pool_size() {
         // Override pool size from configuration
         for shard in config.stores.values_mut() {
@@ -693,10 +763,10 @@ async fn main() {
     );
 
     use Command::*;
-    let result = match opt.cmd {
+    match opt.cmd {
         TxnSpeed { delay } => commands::txn_speed::run(ctx.primary_pool(), delay),
         Info {
-            name,
+            deployment,
             current,
             pending,
             status,
@@ -708,7 +778,7 @@ async fn main() {
             } else {
                 (ctx.primary_pool(), None)
             };
-            commands::info::run(primary, store, name, current, pending, used)
+            commands::info::run(primary, store, deployment, current, pending, used)
         }
         Unused(cmd) => {
             let store = ctx.subgraph_store();
@@ -741,24 +811,26 @@ async fn main() {
         }
         Remove { name } => commands::remove::run(ctx.subgraph_store(), name),
         Create { name } => commands::create::run(ctx.subgraph_store(), name),
-        Unassign { id, shard } => {
-            commands::assign::unassign(logger.clone(), ctx.subgraph_store(), id, shard).await
+        Unassign { deployment } => {
+            let sender = ctx.notification_sender();
+            commands::assign::unassign(ctx.primary_pool(), &sender, &deployment).await
         }
-        Reassign { id, node, shard } => {
-            commands::assign::reassign(ctx.subgraph_store(), id, node, shard)
+        Reassign { deployment, node } => {
+            let sender = ctx.notification_sender();
+            commands::assign::reassign(ctx.primary_pool(), &sender, &deployment, node)
         }
         Rewind {
             force,
             sleep,
             block_hash,
             block_number,
-            names,
+            deployments,
         } => {
             let (store, primary) = ctx.store_and_primary();
             commands::rewind::run(
                 primary,
                 store,
-                names,
+                deployments,
                 block_hash,
                 block_number,
                 force,
@@ -806,8 +878,8 @@ async fn main() {
                     deployment,
                     entity_types,
                 } => {
-                    commands::listen::entities(ctx.subscription_manager(), deployment, entity_types)
-                        .await
+                    let (primary, mgr) = ctx.primary_and_subscription_manager();
+                    commands::listen::entities(primary, mgr, &deployment, entity_types).await
                 }
             }
         }
@@ -819,13 +891,16 @@ async fn main() {
                     shard,
                     node,
                     offset,
-                    src_shard,
-                } => commands::copy::create(ctx.store(), src, src_shard, shard, node, offset).await,
+                } => {
+                    let shards: Vec<_> = ctx.config.stores.keys().cloned().collect();
+                    let (store, primary) = ctx.store_and_primary();
+                    commands::copy::create(store, primary, src, shard, shards, node, offset).await
+                }
                 Activate { deployment, shard } => {
                     commands::copy::activate(ctx.subgraph_store(), deployment, shard)
                 }
                 List => commands::copy::list(ctx.pools()),
-                Status { dst } => commands::copy::status(ctx.pools(), dst),
+                Status { dst } => commands::copy::status(ctx.pools(), &dst),
             }
         }
         Query {
@@ -852,19 +927,47 @@ async fn main() {
                     let (block_store, primary) = ctx.block_store_and_primary_pool();
                     commands::chain::remove(primary, block_store, name)
                 }
+                CheckBlocks { method, chain_name } => {
+                    use commands::check_blocks::{by_hash, by_number, by_range};
+                    use CheckBlockMethod::*;
+                    let logger = ctx.logger.clone();
+                    let (chain_store, ethereum_adapter) =
+                        ctx.chain_store_and_adapter(&chain_name).await?;
+                    match method {
+                        ByHash { hash } => {
+                            by_hash(&hash, chain_store, &ethereum_adapter, &logger).await
+                        }
+                        ByNumber { number } => {
+                            by_number(number, chain_store, &ethereum_adapter, &logger).await
+                        }
+                        ByRange { from, to } => {
+                            by_range(chain_store, &ethereum_adapter, from, to, &logger).await
+                        }
+                    }
+                }
+                Truncate { chain_name, force } => {
+                    use commands::check_blocks::truncate;
+                    let chain_store = ctx.chain_store(&chain_name)?;
+                    truncate(chain_store, force)
+                }
             }
         }
         Stats(cmd) => {
             use StatsCommand::*;
             match cmd {
-                AccountLike { clear, table } => {
-                    commands::stats::account_like(ctx.pools(), clear, table)
+                AccountLike {
+                    clear,
+                    deployment,
+                    table,
+                } => commands::stats::account_like(ctx.pools(), clear, &deployment, table),
+                Show { deployment, table } => {
+                    commands::stats::show(ctx.pools(), &deployment, table)
                 }
-                Show { nsp, table } => commands::stats::show(ctx.pools(), nsp, table),
-                Analyze { id, entity } => {
+                Analyze { deployment, entity } => {
                     let (store, primary_pool) = ctx.store_and_primary();
                     let subgraph_store = store.subgraph_store();
-                    commands::stats::analyze(subgraph_store, primary_pool, id, &entity).await
+                    commands::stats::analyze(subgraph_store, primary_pool, deployment, &entity)
+                        .await
                 }
             }
         }
@@ -874,7 +977,7 @@ async fn main() {
             let subgraph_store = store.subgraph_store();
             match cmd {
                 Create {
-                    id,
+                    deployment,
                     entity,
                     fields,
                     method,
@@ -882,24 +985,25 @@ async fn main() {
                     commands::index::create(
                         subgraph_store,
                         primary_pool,
-                        &id,
+                        deployment,
                         &entity,
                         fields,
                         method,
                     )
                     .await
                 }
-                List { id, entity } => {
-                    commands::index::list(subgraph_store, primary_pool, id, &entity).await
+                List { deployment, entity } => {
+                    commands::index::list(subgraph_store, primary_pool, deployment, &entity).await
                 }
-                Drop { id, index_name } => {
-                    commands::index::drop(subgraph_store, primary_pool, &id, &index_name).await
+                Drop {
+                    deployment,
+                    index_name,
+                } => {
+                    commands::index::drop(subgraph_store, primary_pool, deployment, &index_name)
+                        .await
                 }
             }
         }
-    };
-    if let Err(e) = result {
-        die!("error: {}", e)
     }
 }
 

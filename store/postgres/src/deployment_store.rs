@@ -15,13 +15,10 @@ use rand::{seq::SliceRandom, thread_rng};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Into;
-use std::env;
 use std::iter::FromIterator;
 use std::ops::Bound;
 use std::ops::Deref;
-use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex};
-use std::time::Duration;
 use std::time::Instant;
 
 use graph::components::store::EntityCollection;
@@ -29,10 +26,10 @@ use graph::components::subgraph::ProofOfIndexingFinisher;
 use graph::constraint_violation;
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError, POI_OBJECT};
 use graph::prelude::{
-    anyhow, debug, info, lazy_static, o, warn, web3, ApiSchema, AttributeNames, BlockNumber,
-    BlockPtr, CheapClone, DeploymentHash, DeploymentState, Entity, EntityKey, EntityModification,
+    anyhow, debug, info, o, warn, web3, ApiSchema, AttributeNames, BlockNumber, BlockPtr,
+    CheapClone, DeploymentHash, DeploymentState, Entity, EntityKey, EntityModification,
     EntityQuery, Error, Logger, QueryExecutionError, Schema, StopwatchMetrics, StoreError,
-    StoreEvent, UnfailOutcome, Value, BLOCK_NUMBER_MAX,
+    StoreEvent, UnfailOutcome, Value, ENV_VARS,
 };
 use graph_graphql::prelude::api_schema;
 use web3::types::Address;
@@ -45,22 +42,6 @@ use crate::relational::{Layout, LayoutCache, SqlName, Table};
 use crate::relational_queries::FromEntityData;
 use crate::{connection_pool::ConnectionPool, detail};
 use crate::{dynds, primary::Site};
-
-lazy_static! {
-    /// `GRAPH_QUERY_STATS_REFRESH_INTERVAL` is how long statistics that
-    /// influence query execution are cached in memory (in seconds) before
-    /// they are reloaded from the database. Defaults to 300s (5 minutes).
-    static ref STATS_REFRESH_INTERVAL: Duration = {
-        env::var("GRAPH_QUERY_STATS_REFRESH_INTERVAL")
-        .ok()
-        .map(|s| {
-            let secs = u64::from_str(&s).unwrap_or_else(|_| {
-                panic!("GRAPH_QUERY_STATS_REFRESH_INTERVAL must be a number, but is `{}`", s)
-            });
-            Duration::from_secs(secs)
-        }).unwrap_or(Duration::from_secs(300))
-    };
-}
 
 /// When connected to read replicas, this allows choosing which DB server to use for an operation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -167,7 +148,7 @@ impl DeploymentStore {
             replica_order,
             conn_round_robin_counter: AtomicUsize::new(0),
             subgraph_cache: Mutex::new(LruCache::with_capacity(100)),
-            layout_cache: LayoutCache::new(*STATS_REFRESH_INTERVAL),
+            layout_cache: LayoutCache::new(ENV_VARS.store.query_stats_refresh_interval),
         };
 
         DeploymentStore(Arc::new(store))
@@ -312,7 +293,7 @@ impl DeploymentStore {
         layout: &Layout,
         mods: &[EntityModification],
         ptr: &BlockPtr,
-        stopwatch: StopwatchMetrics,
+        stopwatch: &StopwatchMetrics,
     ) -> Result<i32, StoreError> {
         use EntityModification::*;
         let mut count = 0;
@@ -348,14 +329,14 @@ impl DeploymentStore {
         // Inserts:
         for (entity_type, mut entities) in inserts.into_iter() {
             count +=
-                self.insert_entities(&entity_type, &mut entities, conn, layout, ptr, &stopwatch)?
+                self.insert_entities(&entity_type, &mut entities, conn, layout, ptr, stopwatch)?
                     as i32
         }
 
         // Overwrites:
         for (entity_type, mut entities) in overwrites.into_iter() {
             // we do not update the count since the number of entities remains the same
-            self.overwrite_entities(&entity_type, &mut entities, conn, layout, ptr, &stopwatch)?;
+            self.overwrite_entities(&entity_type, &mut entities, conn, layout, ptr, stopwatch)?;
         }
 
         // Removals
@@ -366,7 +347,7 @@ impl DeploymentStore {
                 conn,
                 layout,
                 ptr,
-                &stopwatch,
+                stopwatch,
             )? as i32;
         }
         Ok(count)
@@ -506,7 +487,7 @@ impl DeploymentStore {
     pub(crate) async fn query_permit(
         &self,
         replica: ReplicaId,
-    ) -> tokio::sync::OwnedSemaphorePermit {
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
         let pool = match replica {
             ReplicaId::Main => &self.pool,
             ReplicaId::ReadOnly(idx) => &self.read_only_pools[idx],
@@ -514,7 +495,7 @@ impl DeploymentStore {
         pool.query_permit().await
     }
 
-    pub(crate) fn wait_stats(&self, replica: ReplicaId) -> PoolWaitStats {
+    pub(crate) fn wait_stats(&self, replica: ReplicaId) -> Result<PoolWaitStats, StoreError> {
         match replica {
             ReplicaId::Main => self.pool.wait_stats(),
             ReplicaId::ReadOnly(idx) => self.read_only_pools[idx].wait_stats(),
@@ -913,26 +894,26 @@ impl DeploymentStore {
         Ok(Some(finisher.finish()))
     }
 
+    /// Get the entity matching `key` from the deployment `site`. Only
+    /// consider entities as of the given `block`
     pub(crate) fn get(
         &self,
         site: Arc<Site>,
         key: &EntityKey,
+        block: BlockNumber,
     ) -> Result<Option<Entity>, StoreError> {
         let conn = self.get_conn()?;
         let layout = self.layout(&conn, site)?;
-
-        // We should really have callers pass in a block number; but until
-        // that is fully plumbed in, we just use the biggest possible block
-        // number so that we will always return the latest version,
-        // i.e., the one with an infinite upper bound
-
-        layout.find(&conn, &key.entity_type, &key.entity_id, BLOCK_NUMBER_MAX)
+        layout.find(&conn, &key.entity_type, &key.entity_id, block)
     }
 
+    /// Retrieve all the entities matching `ids_for_type` from the
+    /// deployment `site`. Only consider entities as of the given `block`
     pub(crate) fn get_many(
         &self,
         site: Arc<Site>,
         ids_for_type: &BTreeMap<&EntityType, Vec<&str>>,
+        block: BlockNumber,
     ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
         if ids_for_type.is_empty() {
             return Ok(BTreeMap::new());
@@ -940,7 +921,7 @@ impl DeploymentStore {
         let conn = self.get_conn()?;
         let layout = self.layout(&conn, site)?;
 
-        layout.find_many(&conn, ids_for_type, BLOCK_NUMBER_MAX)
+        layout.find_many(&conn, ids_for_type, block)
     }
 
     pub(crate) fn get_changes(
@@ -972,7 +953,7 @@ impl DeploymentStore {
         block_ptr_to: &BlockPtr,
         firehose_cursor: Option<&str>,
         mods: &[EntityModification],
-        stopwatch: StopwatchMetrics,
+        stopwatch: &StopwatchMetrics,
         data_sources: &[StoredDynamicDataSource],
         deterministic_errors: &[SubgraphError],
     ) -> Result<StoreEvent, StoreError> {
@@ -1188,9 +1169,10 @@ impl DeploymentStore {
     pub(crate) async fn load_dynamic_data_sources(
         &self,
         id: DeploymentHash,
+        block: BlockNumber,
     ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
         self.with_conn(move |conn, _| {
-            conn.transaction(|| crate::dynds::load(conn, id.as_str()))
+            conn.transaction(|| crate::dynds::load(&conn, id.as_str(), block))
                 .map_err(Into::into)
         })
         .await

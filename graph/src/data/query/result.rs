@@ -57,6 +57,21 @@ impl QueryResults {
     pub fn first(&self) -> Option<&Arc<QueryResult>> {
         self.results.first()
     }
+
+    pub fn has_errors(&self) -> bool {
+        self.results.iter().any(|result| result.has_errors())
+    }
+
+    pub fn not_found(&self) -> bool {
+        self.results.iter().any(|result| result.not_found())
+    }
+
+    pub fn deployment_hash(&self) -> Option<&DeploymentHash> {
+        self.results
+            .iter()
+            .filter_map(|result| result.deployment.as_ref())
+            .next()
+    }
 }
 
 impl Serialize for QueryResults {
@@ -173,7 +188,7 @@ impl QueryResults {
 }
 
 /// The result of running a query, if successful.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct QueryResult {
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -211,6 +226,15 @@ impl QueryResult {
         !self.errors.is_empty()
     }
 
+    pub fn not_found(&self) -> bool {
+        self.errors.iter().any(|e| {
+            matches!(
+                e,
+                QueryError::ExecutionError(QueryExecutionError::DeploymentNotFound(_))
+            )
+        })
+    }
+
     pub fn has_data(&self) -> bool {
         self.data.is_some()
     }
@@ -237,6 +261,10 @@ impl QueryResult {
 
     pub fn errors_mut(&mut self) -> &mut Vec<QueryError> {
         &mut self.errors
+    }
+
+    pub fn data(&self) -> Option<&Data> {
+        self.data.as_ref()
     }
 }
 
